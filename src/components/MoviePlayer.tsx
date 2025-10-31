@@ -37,6 +37,9 @@ const MoviePlayer: React.FC = () => {
   
   const [videoFile, setVideoFile] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string>('');
+  const [fileFormat, setFileFormat] = useState<string>('');
+  const [videoError, setVideoError] = useState<string | null>(null);
+  const [isVideoLoaded, setIsVideoLoaded] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -70,9 +73,17 @@ const MoviePlayer: React.FC = () => {
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
+      // Reset states
+      setVideoError(null);
+      setIsVideoLoaded(false);
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setDuration(0);
+      
       const url = URL.createObjectURL(file);
       setVideoFile(url);
       setFileName(file.name);
+      setFileFormat(file.type || 'Unknown');
       // Reset subtitle tracks when new video is loaded
       setSubtitleTracks([]);
       setSelectedSubtitleTrack('off');
@@ -113,6 +124,9 @@ const MoviePlayer: React.FC = () => {
       const url = URL.createObjectURL(videoFile);
       setVideoFile(url);
       setFileName(videoFile.name);
+      setFileFormat(videoFile.type || 'Unknown');
+      setVideoError(null);
+      setIsVideoLoaded(false);
     }
 
     if (subtitleFile) {
@@ -273,6 +287,8 @@ const MoviePlayer: React.FC = () => {
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
       setDuration(videoRef.current.duration);
+      setIsVideoLoaded(true);
+      setVideoError(null);
       
       // Get audio tracks
       const tracks: AudioTrack[] = [];
@@ -305,11 +321,43 @@ const MoviePlayer: React.FC = () => {
   const handlePlay = () => {
     setIsPlaying(true);
     setIsBuffering(false);
+    setVideoError(null);
   };
   
   const handlePause = () => setIsPlaying(false);
   const handleWaiting = () => setIsBuffering(true);
   const handleCanPlay = () => setIsBuffering(false);
+  
+  const handleError = () => {
+    setIsBuffering(false);
+    setIsPlaying(false);
+    const video = videoRef.current;
+    if (video && video.error) {
+      let errorMessage = 'Video playback error';
+      switch (video.error.code) {
+        case 1:
+          errorMessage = 'Video loading was aborted';
+          break;
+        case 2:
+          errorMessage = 'Network error occurred while loading video';
+          break;
+        case 3:
+          errorMessage = 'Video format not supported or corrupted';
+          break;
+        case 4:
+          errorMessage = 'Video format not supported by your browser';
+          break;
+        default:
+          errorMessage = 'Unknown video error occurred';
+      }
+      setVideoError(errorMessage);
+    }
+  };
+
+  const handleLoadStart = () => {
+    setIsBuffering(true);
+    setVideoError(null);
+  };
 
   // Mouse movement for controls visibility
   const handleMouseMove = useCallback(() => {
@@ -364,7 +412,7 @@ const MoviePlayer: React.FC = () => {
             <input
               ref={fileInputRef}
               type="file"
-              accept="video/*"
+              accept="video/*,.mkv,.avi,.mov,.wmv,.flv,.webm,.m4v"
               onChange={handleFileSelect}
               className="hidden"
               id="video-upload"
@@ -395,7 +443,11 @@ const MoviePlayer: React.FC = () => {
             </div>
           </div>
           
-          <p className="text-sm text-gray-500 mt-6">Supports MP4, MKV, AVI, MOV, WebM and more</p>
+          <div className="text-sm text-gray-500 mt-6 space-y-2">
+            <p><strong>Best Support:</strong> MP4, WebM, OGG</p>
+            <p><strong>Limited Support:</strong> MKV, AVI, MOV (depends on codecs)</p>
+            <p className="text-xs text-gray-600">For MKV files, ensure they use H.264/H.265 video and AAC/MP3 audio codecs</p>
+          </div>
         </div>
       </div>
     );
@@ -413,14 +465,17 @@ const MoviePlayer: React.FC = () => {
         ref={videoRef}
         src={videoFile}
         className="w-full h-full object-contain"
+        onLoadStart={handleLoadStart}
         onLoadedMetadata={handleLoadedMetadata}
         onTimeUpdate={handleTimeUpdate}
         onPlay={handlePlay}
         onPause={handlePause}
         onWaiting={handleWaiting}
         onCanPlay={handleCanPlay}
+        onError={handleError}
         onClick={togglePlayPause}
         crossOrigin="anonymous"
+        preload="metadata"
       >
         {/* Subtitle tracks */}
         {subtitleTracks.map((track) => (
@@ -435,15 +490,67 @@ const MoviePlayer: React.FC = () => {
         ))}
       </video>
 
+      {/* Error Message */}
+      {videoError && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-80">
+          <div className="bg-gray-900 border border-red-600 rounded-xl p-8 text-center max-w-md mx-4">
+            <div className="text-red-500 mb-4">
+              <X className="w-16 h-16 mx-auto" />
+            </div>
+            <h3 className="text-xl font-bold text-white mb-4">Playback Error</h3>
+            <p className="text-gray-300 mb-4">{videoError}</p>
+            <div className="text-sm text-gray-400 mb-6">
+              <p><strong>File:</strong> {fileName}</p>
+              <p><strong>Format:</strong> {fileFormat}</p>
+            </div>
+            <div className="space-y-3">
+              <button
+                onClick={() => {
+                  setVideoError(null);
+                  if (videoRef.current) {
+                    videoRef.current.load();
+                  }
+                }}
+                className="bg-red-600 hover:bg-red-700 text-white px-6 py-2 rounded-lg transition-colors"
+              >
+                Try Again
+              </button>
+              <button
+                onClick={() => {
+                  setVideoFile(null);
+                  setVideoError(null);
+                  setFileName('');
+                }}
+                className="bg-gray-700 hover:bg-gray-600 text-white px-6 py-2 rounded-lg transition-colors ml-3"
+              >
+                Choose Different File
+              </button>
+            </div>
+            <div className="mt-6 text-xs text-gray-500 border-t border-gray-700 pt-4">
+              <p className="mb-2"><strong>Tips for MKV files:</strong></p>
+              <ul className="text-left space-y-1">
+                <li>• Ensure video codec is H.264 or H.265</li>
+                <li>• Ensure audio codec is AAC or MP3</li>
+                <li>• Consider converting to MP4 for better compatibility</li>
+                <li>• Try using a different browser (Chrome/Edge work best)</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Buffering Indicator */}
-      {isBuffering && (
+      {isBuffering && !videoError && (
         <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-30">
-          <div className="animate-spin rounded-full h-16 w-16 border-4 border-red-600 border-t-transparent"></div>
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-16 w-16 border-4 border-red-600 border-t-transparent mx-auto mb-4"></div>
+            <p className="text-white text-lg">Loading video...</p>
+            <p className="text-gray-400 text-sm mt-2">{fileName}</p>
+          </div>
         </div>
       )}
 
       {/* Central Play Button Overlay */}
-      {!isPlaying && !isBuffering && (
+      {!isPlaying && !isBuffering && !videoError && isVideoLoaded && (
         <div 
           className="absolute inset-0 flex items-center justify-center cursor-pointer bg-black bg-opacity-20 transition-all duration-300"
           onClick={togglePlayPause}
@@ -644,7 +751,7 @@ const MoviePlayer: React.FC = () => {
 
             {/* File Name */}
             <div className="text-white text-sm max-w-48 truncate bg-black bg-opacity-50 px-3 py-1 rounded">
-              {fileName}
+              {fileName} {fileFormat && `(${fileFormat.split('/')[1]?.toUpperCase() || 'Unknown'})`}
             </div>
 
             {/* Fullscreen */}
