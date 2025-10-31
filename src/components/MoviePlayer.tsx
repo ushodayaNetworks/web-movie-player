@@ -1,18 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { 
-  Play, 
-  Pause, 
-  Volume2, 
-  VolumeX, 
-  Maximize, 
-  SkipBack, 
-  SkipForward,
-  Upload,
-  Settings,
-  Subtitles,
-  X,
-  Minimize
-} from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, SkipBack, SkipForward, Upload, Settings, Files as Subtitles, X, Minimize } from 'lucide-react';
 
 interface AudioTrack {
   id: string;
