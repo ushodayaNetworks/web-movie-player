@@ -406,23 +406,49 @@ const MoviePlayer: React.FC = () => {
 
   // Handle subtitle track selection
   useEffect(() => {
-    if (videoRef.current && videoRef.current.textTracks) {
-      const textTracks = videoRef.current.textTracks;
+    const timer = setTimeout(() => {
+      if (videoRef.current && videoRef.current.textTracks) {
+        const textTracks = videoRef.current.textTracks;
 
-      // Disable all tracks first
-      for (let i = 0; i < textTracks.length; i++) {
-        textTracks[i].mode = 'hidden';
-      }
+        // Disable all tracks first
+        for (let i = 0; i < textTracks.length; i++) {
+          textTracks[i].mode = 'hidden';
+        }
 
-      // Enable selected track
-      if (selectedSubtitleTrack !== 'off' && selectedSubtitleTrack.startsWith('embedded-')) {
-        const trackIndex = parseInt(selectedSubtitleTrack.replace('embedded-', ''));
-        if (textTracks[trackIndex]) {
-          textTracks[trackIndex].mode = 'showing';
+        // Enable selected track
+        if (selectedSubtitleTrack !== 'off') {
+          if (selectedSubtitleTrack.startsWith('embedded-')) {
+            // Handle embedded tracks
+            const trackIndex = parseInt(selectedSubtitleTrack.replace('embedded-', ''));
+            if (textTracks[trackIndex]) {
+              textTracks[trackIndex].mode = 'showing';
+            }
+          } else {
+            // Handle external subtitle tracks - find by position in subtitleTracks
+            const trackIndex = subtitleTracks.findIndex(t => t.id === selectedSubtitleTrack);
+            if (trackIndex !== -1) {
+              // External tracks come after embedded tracks
+              const externalTrackIndex = Array.from(textTracks).findIndex((track, idx) => {
+                return track.label === subtitleTracks[trackIndex].label && !track.label.includes('Subtitle');
+              });
+
+              // Fallback: just iterate to find matching label
+              for (let i = 0; i < textTracks.length; i++) {
+                const track = textTracks[i];
+                if (track.label === subtitleTracks[trackIndex].label &&
+                    track.kind === 'subtitles') {
+                  track.mode = 'showing';
+                  break;
+                }
+              }
+            }
+          }
         }
       }
-    }
-  }, [selectedSubtitleTrack]);
+    }, 50);
+
+    return () => clearTimeout(timer);
+  }, [selectedSubtitleTrack, subtitleTracks]);
 
   const progress = duration ? (currentTime / duration) * 100 : 0;
 
@@ -516,7 +542,6 @@ const MoviePlayer: React.FC = () => {
             src={track.src}
             srcLang={track.language}
             label={track.label}
-            default={selectedSubtitleTrack === track.id}
           />
         ))}
       </video>
