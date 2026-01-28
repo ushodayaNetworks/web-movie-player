@@ -1,5 +1,6 @@
+import { SubtitleParser as MatroskaSubtitles } from 'matroska-subtitles';
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Play, Pause, Volume2, VolumeX, Maximize, SkipBack, SkipForward, Upload, Settings, Files as Subtitles, X, Minimize } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, SkipBack, SkipForward, Upload, Settings, Files as SubtitlesIcon, X, Minimize } from 'lucide-react';
 
 interface AudioTrack {
   id: string;
@@ -11,7 +12,8 @@ interface SubtitleTrack {
   id: string;
   label: string;
   language: string;
-  src: string;
+  src?: string;
+  isEmbedded?: boolean;
 }
 
 const MoviePlayer: React.FC = () => {
@@ -21,7 +23,7 @@ const MoviePlayer: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
   const controlsTimeoutRef = useRef<NodeJS.Timeout>();
-  
+
   const [videoFile, setVideoFile] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string>('');
   const [fileFormat, setFileFormat] = useState<string>('');
@@ -43,20 +45,106 @@ const MoviePlayer: React.FC = () => {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [parsingProgress, setParsingProgress] = useState(0);
+
+  // Refs for MKV parsing
+  const parserRef = useRef<any>(null);
+  const embeddedCuesRef = useRef<Record<number, any[]>>({}); // trackNumber -> cues[]
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Format time to mm:ss or h:mm:ss
   const formatTime = (time: number): string => {
     const hours = Math.floor(time / 3600);
     const minutes = Math.floor((time % 3600) / 60);
     const seconds = Math.floor(time % 60);
-    
+
     if (hours > 0) {
       return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
     }
     return `${minutes}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  // Parse MKV file
+  const parseMkvFile = (file: File) => {
+    // Abort previous parsing
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+    const signal = abortController.signal;
+
+    const parser = new MatroskaSubtitles();
+    parserRef.current = parser;
+    embeddedCuesRef.current = {};
+    setParsingProgress(0);
+    console.log('MKV Parser Initialized for file:', file.name);
+
+    parser.once('tracks', (tracks: any[]) => {
+      if (signal.aborted) return;
+
+      const embeddedTracks: SubtitleTrack[] = tracks
+        .filter((track: any) => track.type === 17) // 17 is subtitle track type
+        .map((track: any) => ({
+          id: `embedded-${track.number}`,
+          label: track.name || track.language || `Embedded Track ${track.number}`,
+          language: track.language || 'Unknown',
+          isEmbedded: true
+        }));
+
+      if (embeddedTracks.length > 0) {
+        setSubtitleTracks(prev => {
+          // Keep only non-embedded tracks
+          const existing = prev.filter(t => !t.isEmbedded);
+          return [...existing, ...embeddedTracks];
+        });
+      }
+    });
+
+    parser.on('subtitle', (subtitle: any, trackNumber: number) => {
+      if (signal.aborted) return;
+      if (!embeddedCuesRef.current[trackNumber]) {
+        embeddedCuesRef.current[trackNumber] = [];
+      }
+      embeddedCuesRef.current[trackNumber].push(subtitle);
+    });
+
+    // Read file in chunks
+    const chunkSize = 2 * 1024 * 1024; // 2MB
+    let offset = 0;
+
+    const readChunk = () => {
+      if (offset >= file.size || signal.aborted) {
+        setParsingProgress(100);
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        if (signal.aborted) return;
+        const buffer = e.target?.result as ArrayBuffer;
+        if (buffer) {
+          try {
+            parser.push(new Uint8Array(buffer));
+          } catch (err) {
+            console.error('MKV parsing error:', err);
+          }
+          offset += chunkSize;
+          setParsingProgress(Math.min(99, Math.round((offset / file.size) * 100)));
+          // Continue reading
+          readChunk();
+        }
+      };
+
+      const blob = file.slice(offset, offset + chunkSize);
+      reader.readAsArrayBuffer(blob);
+    };
+
+    readChunk();
+  };
+
   // Handle file selection
+
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
@@ -66,7 +154,7 @@ const MoviePlayer: React.FC = () => {
       setIsPlaying(false);
       setCurrentTime(0);
       setDuration(0);
-      
+
       const url = URL.createObjectURL(file);
       setVideoFile(url);
       setFileName(file.name);
@@ -74,35 +162,137 @@ const MoviePlayer: React.FC = () => {
       // Reset subtitle tracks when new video is loaded
       setSubtitleTracks([]);
       setSelectedSubtitleTrack('off');
+
+      // Parse if MKV
+      if (file.name.toLowerCase().endsWith('.mkv')) {
+        parseMkvFile(file);
+      }
     }
   };
 
+  // Convert SRT format to VTT format
+  const convertSrtToVtt = (srtContent: string): string => {
+    // Add VTT header
+    let vttContent = 'WEBVTT\n\n';
+
+    // Replace SRT timestamp format (00:00:00,000) with VTT format (00:00:00.000)
+    const converted = srtContent
+      .replace(/\r\n/g, '\n') // Normalize line endings
+      .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2'); // Convert comma to dot in timestamps
+
+    // Remove sequence numbers (lines that are just numbers before timestamps)
+    const lines = converted.split('\n');
+    const vttLines: string[] = [];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      // Skip empty lines at the start
+      if (vttLines.length === 0 && line === '') continue;
+      // Skip numeric sequence numbers (lines that are just numbers)
+      if (/^\d+$/.test(line) && i + 1 < lines.length && lines[i + 1].includes('-->')) {
+        continue;
+      }
+      vttLines.push(lines[i]);
+    }
+
+    return vttContent + vttLines.join('\n');
+  };
+
+  // Convert ASS/SSA format to VTT format
+  const convertAssToVtt = (assContent: string): string => {
+    let vttContent = 'WEBVTT\n\n';
+
+    const lines = assContent.split(/\r?\n/);
+    const dialogueLines: string[] = [];
+
+    for (const line of lines) {
+      if (line.startsWith('Dialogue:')) {
+        // Format: Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+        const parts = line.substring(10).split(',');
+        if (parts.length >= 10) {
+          const start = parts[1].trim();
+          const end = parts[2].trim();
+          // Text is everything after the 9th comma
+          let text = parts.slice(9).join(',').trim();
+
+          // Remove ASS formatting tags like {\an8}, {\pos(x,y)}, etc.
+          text = text.replace(/\{[^}]*\}/g, '');
+          // Convert \N to newline
+          text = text.replace(/\\N/g, '\n');
+
+          // Convert ASS time format (H:MM:SS.CC) to VTT (HH:MM:SS.MMM)
+          const convertTime = (t: string): string => {
+            const match = t.match(/(\d+):(\d{2}):(\d{2})\.(\d{2})/);
+            if (match) {
+              const hours = match[1].padStart(2, '0');
+              const mins = match[2];
+              const secs = match[3];
+              const centisecs = match[4];
+              return `${hours}:${mins}:${secs}.${centisecs}0`;
+            }
+            return t;
+          };
+
+          dialogueLines.push(`${convertTime(start)} --> ${convertTime(end)}\n${text}\n`);
+        }
+      }
+    }
+
+    return vttContent + dialogueLines.join('\n');
+  };
+
   // Handle subtitle file selection
-  const handleSubtitleSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSubtitleSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
-      const url = URL.createObjectURL(file);
-      const newTrack: SubtitleTrack = {
-        id: `subtitle-${Date.now()}`,
-        label: file.name.replace(/\.[^/.]+$/, ""),
-        language: 'Unknown',
-        src: url
-      };
-      
-      setSubtitleTracks(prev => [...prev, newTrack]);
-      setSelectedSubtitleTrack(newTrack.id);
+      const fileName = file.name.toLowerCase();
+      let blobUrl: string;
+
+      try {
+        if (fileName.endsWith('.vtt')) {
+          // VTT files can be used directly
+          blobUrl = URL.createObjectURL(file);
+        } else if (fileName.endsWith('.srt')) {
+          // Convert SRT to VTT
+          const text = await file.text();
+          const vttContent = convertSrtToVtt(text);
+          const blob = new Blob([vttContent], { type: 'text/vtt' });
+          blobUrl = URL.createObjectURL(blob);
+        } else if (fileName.endsWith('.ass') || fileName.endsWith('.ssa')) {
+          // Convert ASS/SSA to VTT
+          const text = await file.text();
+          const vttContent = convertAssToVtt(text);
+          const blob = new Blob([vttContent], { type: 'text/vtt' });
+          blobUrl = URL.createObjectURL(blob);
+        } else {
+          // Unknown format, try using directly
+          blobUrl = URL.createObjectURL(file);
+        }
+
+        const newTrack: SubtitleTrack = {
+          id: `subtitle-${Date.now()}`,
+          label: file.name.replace(/\.[^/.]+$/, ""),
+          language: 'Unknown',
+          src: blobUrl
+        };
+
+        setSubtitleTracks(prev => [...prev, newTrack]);
+        setSelectedSubtitleTrack(newTrack.id);
+      } catch (error) {
+        console.error('Error processing subtitle file:', error);
+      }
     }
   };
 
   // Handle drag and drop
-  const handleDrop = (event: React.DragEvent) => {
+  const handleDrop = async (event: React.DragEvent) => {
     event.preventDefault();
     const files = Array.from(event.dataTransfer.files);
-    
-    const videoFile = files.find(file => file.type.startsWith('video/'));
-    const subtitleFile = files.find(file => 
-      file.name.endsWith('.srt') || 
-      file.name.endsWith('.vtt') || 
+
+    const videoFile = files.find(file => file.type.startsWith('video/') || file.name.toLowerCase().endsWith('.mkv'));
+    const subtitleFile = files.find(file =>
+      file.name.endsWith('.srt') ||
+      file.name.endsWith('.vtt') ||
       file.name.endsWith('.ass') ||
       file.name.endsWith('.ssa')
     );
@@ -114,19 +304,47 @@ const MoviePlayer: React.FC = () => {
       setFileFormat(videoFile.type || 'Unknown');
       setVideoError(null);
       setIsVideoLoaded(false);
+      setSubtitleTracks([]);
+      setSelectedSubtitleTrack('off');
+
+      if (videoFile.name.toLowerCase().endsWith('.mkv')) {
+        parseMkvFile(videoFile);
+      }
     }
 
     if (subtitleFile) {
-      const url = URL.createObjectURL(subtitleFile);
-      const newTrack: SubtitleTrack = {
-        id: `subtitle-${Date.now()}`,
-        label: subtitleFile.name.replace(/\.[^/.]+$/, ""),
-        language: 'Unknown',
-        src: url
-      };
-      
-      setSubtitleTracks(prev => [...prev, newTrack]);
-      setSelectedSubtitleTrack(newTrack.id);
+      const subFileName = subtitleFile.name.toLowerCase();
+      let blobUrl: string;
+
+      try {
+        if (subFileName.endsWith('.vtt')) {
+          blobUrl = URL.createObjectURL(subtitleFile);
+        } else if (subFileName.endsWith('.srt')) {
+          const text = await subtitleFile.text();
+          const vttContent = convertSrtToVtt(text);
+          const blob = new Blob([vttContent], { type: 'text/vtt' });
+          blobUrl = URL.createObjectURL(blob);
+        } else if (subFileName.endsWith('.ass') || subFileName.endsWith('.ssa')) {
+          const text = await subtitleFile.text();
+          const vttContent = convertAssToVtt(text);
+          const blob = new Blob([vttContent], { type: 'text/vtt' });
+          blobUrl = URL.createObjectURL(blob);
+        } else {
+          blobUrl = URL.createObjectURL(subtitleFile);
+        }
+
+        const newTrack: SubtitleTrack = {
+          id: `subtitle-${Date.now()}`,
+          label: subtitleFile.name.replace(/\.[^/.]+$/, ""),
+          language: 'Unknown',
+          src: blobUrl
+        };
+
+        setSubtitleTracks(prev => [...prev, newTrack]);
+        setSelectedSubtitleTrack(newTrack.id);
+      } catch (error) {
+        console.error('Error processing subtitle file:', error);
+      }
     }
   };
 
@@ -211,11 +429,11 @@ const MoviePlayer: React.FC = () => {
   // Show controls with auto-hide
   const showControlsWithTimeout = useCallback(() => {
     setShowControls(true);
-    
+
     if (controlsTimeoutRef.current) {
       clearTimeout(controlsTimeoutRef.current);
     }
-    
+
     if (isPlaying) {
       controlsTimeoutRef.current = setTimeout(() => {
         setShowControls(false);
@@ -226,7 +444,7 @@ const MoviePlayer: React.FC = () => {
   // Keyboard shortcuts
   const handleKeyPress = useCallback((event: KeyboardEvent) => {
     if (event.target instanceof HTMLInputElement) return;
-    
+
     switch (event.code) {
       case 'Space':
         event.preventDefault();
@@ -333,11 +551,11 @@ const MoviePlayer: React.FC = () => {
     setIsBuffering(false);
     setVideoError(null);
   };
-  
+
   const handlePause = () => setIsPlaying(false);
   const handleWaiting = () => setIsBuffering(true);
   const handleCanPlay = () => setIsBuffering(false);
-  
+
   const handleError = () => {
     setIsBuffering(false);
     setIsPlaying(false);
@@ -390,7 +608,7 @@ const MoviePlayer: React.FC = () => {
     const handleFullscreenChange = () => {
       setIsFullscreen(!!document.fullscreenElement);
     };
-    
+
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
   }, []);
@@ -406,48 +624,68 @@ const MoviePlayer: React.FC = () => {
 
   // Handle subtitle track selection
   useEffect(() => {
-    const timer = setTimeout(() => {
-      if (videoRef.current && videoRef.current.textTracks) {
-        const textTracks = videoRef.current.textTracks;
+    if (videoRef.current) {
+      const video = videoRef.current;
+      const textTracks = video.textTracks;
 
-        // Disable all tracks first
+      // Helper to find track in TextTrackList
+      const findTextTrack = (label: string, language: string) => {
+        return Array.from(textTracks).find(t => t.label === label && t.language === language);
+      };
+
+      const selectedTrackInfo = subtitleTracks.find(t => t.id === selectedSubtitleTrack);
+
+      // Hide all tracks first
+      for (let i = 0; i < textTracks.length; i++) {
+        textTracks[i].mode = 'hidden';
+      }
+
+      // If no track is selected or 'off', return early
+      if (selectedSubtitleTrack === 'off' || !selectedTrackInfo) {
+        return;
+      }
+
+      // Handle external (non-embedded) subtitle tracks
+      if (!selectedTrackInfo.isEmbedded && selectedTrackInfo.src) {
+        // Find the track by label
         for (let i = 0; i < textTracks.length; i++) {
-          textTracks[i].mode = 'hidden';
-        }
-
-        // Enable selected track
-        if (selectedSubtitleTrack !== 'off') {
-          if (selectedSubtitleTrack.startsWith('embedded-')) {
-            // Handle embedded tracks
-            const trackIndex = parseInt(selectedSubtitleTrack.replace('embedded-', ''));
-            if (textTracks[trackIndex]) {
-              textTracks[trackIndex].mode = 'showing';
-            }
-          } else {
-            // Handle external subtitle tracks - find by position in subtitleTracks
-            const trackIndex = subtitleTracks.findIndex(t => t.id === selectedSubtitleTrack);
-            if (trackIndex !== -1) {
-              // External tracks come after embedded tracks
-              const externalTrackIndex = Array.from(textTracks).findIndex((track, idx) => {
-                return track.label === subtitleTracks[trackIndex].label && !track.label.includes('Subtitle');
-              });
-
-              // Fallback: just iterate to find matching label
-              for (let i = 0; i < textTracks.length; i++) {
-                const track = textTracks[i];
-                if (track.label === subtitleTracks[trackIndex].label &&
-                    track.kind === 'subtitles') {
-                  track.mode = 'showing';
-                  break;
-                }
-              }
-            }
+          const track = textTracks[i];
+          if (track.label === selectedTrackInfo.label) {
+            track.mode = 'showing';
+            break;
           }
         }
+        return;
       }
-    }, 50);
 
-    return () => clearTimeout(timer);
+      // Handle embedded tracks
+      if (selectedTrackInfo.isEmbedded) {
+        const exists = findTextTrack(selectedTrackInfo.label, selectedTrackInfo.language);
+        if (exists) {
+          exists.mode = 'showing';
+        } else {
+          // Create the track if it doesn't exist
+          const track = video.addTextTrack('subtitles', selectedTrackInfo.label, selectedTrackInfo.language);
+
+          const trackNumber = parseInt(selectedTrackInfo.id.replace('embedded-', ''));
+          const cues = embeddedCuesRef.current[trackNumber] || [];
+
+          cues.forEach((cueData: any) => {
+            try {
+              const startTime = cueData.time / 1000;
+              const endTime = (cueData.time + cueData.duration) / 1000;
+              // @ts-ignore - VTTCue is available in browser
+              const cue = new VTTCue(startTime, endTime, cueData.text);
+              track.addCue(cue);
+            } catch (e) {
+              console.error('Error adding cue:', e);
+            }
+          });
+
+          track.mode = 'showing';
+        }
+      }
+    }
   }, [selectedSubtitleTrack, subtitleTracks]);
 
   const progress = duration ? (currentTime / duration) * 100 : 0;
@@ -455,7 +693,7 @@ const MoviePlayer: React.FC = () => {
   if (!videoFile) {
     return (
       <div className="min-h-screen bg-black flex items-center justify-center p-8">
-        <div 
+        <div
           className="bg-gray-900 border-2 border-dashed border-gray-600 rounded-xl p-12 text-center max-w-lg w-full hover:border-red-600 transition-all duration-300 hover:bg-gray-800"
           onDrop={handleDrop}
           onDragOver={handleDragOver}
@@ -463,7 +701,7 @@ const MoviePlayer: React.FC = () => {
           <Upload className="w-20 h-20 text-gray-400 mx-auto mb-6" />
           <h2 className="text-3xl font-bold text-white mb-4">Upload Your Video</h2>
           <p className="text-gray-400 mb-8 text-lg">Drag and drop your video file here, or click to browse</p>
-          
+
           <div className="space-y-4">
             <input
               ref={fileInputRef}
@@ -479,7 +717,7 @@ const MoviePlayer: React.FC = () => {
             >
               Choose Video File
             </label>
-            
+
             <div className="text-gray-500">
               <p className="text-sm mb-2">You can also add subtitle files (.srt, .vtt, .ass)</p>
               <input
@@ -498,7 +736,7 @@ const MoviePlayer: React.FC = () => {
               </label>
             </div>
           </div>
-          
+
           <div className="text-sm text-gray-500 mt-6 space-y-2">
             <p><strong>Best Support:</strong> MP4, WebM, OGG</p>
             <p><strong>Limited Support:</strong> MKV, AVI, MOV (depends on codecs)</p>
@@ -511,7 +749,7 @@ const MoviePlayer: React.FC = () => {
   }
 
   return (
-    <div 
+    <div
       ref={containerRef}
       className="relative bg-black min-h-screen flex items-center justify-center overflow-hidden"
       onMouseMove={handleMouseMove}
@@ -535,7 +773,7 @@ const MoviePlayer: React.FC = () => {
         preload="metadata"
       >
         {/* Subtitle tracks */}
-        {subtitleTracks.map((track) => (
+        {subtitleTracks.filter(t => !t.isEmbedded).map((track) => (
           <track
             key={track.id}
             kind="subtitles"
@@ -607,7 +845,7 @@ const MoviePlayer: React.FC = () => {
 
       {/* Central Play Button Overlay */}
       {!isPlaying && !isBuffering && !videoError && isVideoLoaded && (
-        <div 
+        <div
           className="absolute inset-0 flex items-center justify-center cursor-pointer bg-black bg-opacity-20 transition-all duration-300"
           onClick={togglePlayPause}
         >
@@ -618,19 +856,18 @@ const MoviePlayer: React.FC = () => {
       )}
 
       {/* Controls Overlay */}
-      <div 
-        className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black via-black/80 to-transparent transition-all duration-300 ${
-          showControls || !isPlaying ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'
-        }`}
+      <div
+        className={`absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black via-black/80 to-transparent transition-all duration-300 ${showControls || !isPlaying ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-4'
+          }`}
       >
         {/* Progress Bar */}
         <div className="px-6 pb-2">
-          <div 
+          <div
             ref={progressRef}
             className="w-full h-1 bg-gray-600 rounded-full cursor-pointer hover:h-2 transition-all duration-200 group"
             onClick={handleProgressClick}
           >
-            <div 
+            <div
               className="h-full bg-red-600 rounded-full transition-all duration-200 relative"
               style={{ width: `${progress}%` }}
             >
@@ -702,7 +939,7 @@ const MoviePlayer: React.FC = () => {
               className="text-white hover:text-red-400 transition-colors p-2 rounded-full hover:bg-white hover:bg-opacity-10"
               title="Subtitles & Settings"
             >
-              <Subtitles className="w-6 h-6" />
+              <SubtitlesIcon className="w-6 h-6" />
             </button>
 
             {/* Settings Menu */}
@@ -726,11 +963,10 @@ const MoviePlayer: React.FC = () => {
                       <button
                         key={rate}
                         onClick={() => handlePlaybackRateChange(rate)}
-                        className={`px-3 py-2 rounded text-sm transition-colors ${
-                          playbackRate === rate 
-                            ? 'bg-red-600 text-white' 
-                            : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                        }`}
+                        className={`px-3 py-2 rounded text-sm transition-colors ${playbackRate === rate
+                          ? 'bg-red-600 text-white'
+                          : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                          }`}
                       >
                         {rate}x
                       </button>
@@ -740,15 +976,19 @@ const MoviePlayer: React.FC = () => {
 
                 {/* Subtitles */}
                 <div className="mb-4">
-                  <div className="text-white text-sm font-medium mb-2">Subtitles</div>
+                  <div className="text-white text-sm font-medium mb-2 flex justify-between items-center">
+                    <span>Subtitles</span>
+                    {parsingProgress > 0 && parsingProgress < 100 && (
+                      <span className="text-xs text-yellow-400 animate-pulse">Scanning: {parsingProgress}%</span>
+                    )}
+                  </div>
                   <div className="space-y-1">
                     <button
                       onClick={() => setSelectedSubtitleTrack('off')}
-                      className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                        selectedSubtitleTrack === 'off'
-                          ? 'bg-red-600 text-white'
-                          : 'text-gray-300 hover:bg-gray-700'
-                      }`}
+                      className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${selectedSubtitleTrack === 'off'
+                        ? 'bg-red-600 text-white'
+                        : 'text-gray-300 hover:bg-gray-700'
+                        }`}
                     >
                       Off
                     </button>
@@ -756,11 +996,10 @@ const MoviePlayer: React.FC = () => {
                       <button
                         key={track.id}
                         onClick={() => setSelectedSubtitleTrack(track.id)}
-                        className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                          selectedSubtitleTrack === track.id
-                            ? 'bg-red-600 text-white'
-                            : 'text-gray-300 hover:bg-gray-700'
-                        }`}
+                        className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${selectedSubtitleTrack === track.id
+                          ? 'bg-red-600 text-white'
+                          : 'text-gray-300 hover:bg-gray-700'
+                          }`}
                       >
                         <div className="flex items-center justify-between">
                           <span>{track.label}</span>
@@ -798,11 +1037,10 @@ const MoviePlayer: React.FC = () => {
                         <button
                           key={track.id}
                           onClick={() => setSelectedAudioTrack(track.id)}
-                          className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                            selectedAudioTrack === track.id 
-                              ? 'bg-red-600 text-white' 
-                              : 'text-gray-300 hover:bg-gray-700'
-                          }`}
+                          className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${selectedAudioTrack === track.id
+                            ? 'bg-red-600 text-white'
+                            : 'text-gray-300 hover:bg-gray-700'
+                            }`}
                         >
                           {track.label} ({track.language})
                         </button>
@@ -830,7 +1068,7 @@ const MoviePlayer: React.FC = () => {
       </div>
 
       {/* Keyboard Shortcuts Info - Only on Hover */}
-      <div 
+      <div
         className="absolute top-4 right-4 transition-all duration-300"
         onMouseEnter={() => setShowShortcuts(true)}
         onMouseLeave={() => setShowShortcuts(false)}
@@ -838,7 +1076,7 @@ const MoviePlayer: React.FC = () => {
         <div className="text-white bg-black bg-opacity-60 p-2 rounded-full cursor-help">
           <Settings className="w-5 h-5" />
         </div>
-        
+
         {showShortcuts && (
           <div className="absolute top-full right-0 mt-2 text-xs text-gray-300 bg-black bg-opacity-90 backdrop-blur-sm p-4 rounded-lg shadow-2xl border border-gray-700 min-w-48">
             <div className="font-semibold text-white mb-2">Keyboard Shortcuts</div>
