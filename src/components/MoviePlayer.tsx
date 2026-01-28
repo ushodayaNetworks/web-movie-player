@@ -276,11 +276,11 @@ const MoviePlayer: React.FC = () => {
       setDuration(videoRef.current.duration);
       setIsVideoLoaded(true);
       setVideoError(null);
-      
+
       // Get audio tracks
       const tracks: AudioTrack[] = [];
       const audioTracks = videoRef.current.audioTracks;
-      
+
       if (audioTracks) {
         for (let i = 0; i < audioTracks.length; i++) {
           const track = audioTracks[i];
@@ -291,10 +291,33 @@ const MoviePlayer: React.FC = () => {
           });
         }
       }
-      
+
       setAudioTracks(tracks);
       if (tracks.length > 0) {
         setSelectedAudioTrack('0');
+      }
+
+      // Get embedded text/subtitle tracks from the video file (e.g., from MKV)
+      const textTracks = videoRef.current.textTracks;
+      const embeddedSubtitles: SubtitleTrack[] = [];
+
+      if (textTracks && textTracks.length > 0) {
+        for (let i = 0; i < textTracks.length; i++) {
+          const track = textTracks[i];
+          if (track.kind === 'subtitles' || track.kind === 'captions') {
+            embeddedSubtitles.push({
+              id: `embedded-${i}`,
+              label: track.label || `${track.kind} ${i + 1}`,
+              language: track.language || 'Unknown',
+              src: ''
+            });
+            track.mode = 'hidden';
+          }
+        }
+
+        if (embeddedSubtitles.length > 0) {
+          setSubtitleTracks(embeddedSubtitles);
+        }
       }
     }
   };
@@ -381,6 +404,26 @@ const MoviePlayer: React.FC = () => {
     };
   }, []);
 
+  // Handle subtitle track selection
+  useEffect(() => {
+    if (videoRef.current && videoRef.current.textTracks) {
+      const textTracks = videoRef.current.textTracks;
+
+      // Disable all tracks first
+      for (let i = 0; i < textTracks.length; i++) {
+        textTracks[i].mode = 'hidden';
+      }
+
+      // Enable selected track
+      if (selectedSubtitleTrack !== 'off' && selectedSubtitleTrack.startsWith('embedded-')) {
+        const trackIndex = parseInt(selectedSubtitleTrack.replace('embedded-', ''));
+        if (textTracks[trackIndex]) {
+          textTracks[trackIndex].mode = 'showing';
+        }
+      }
+    }
+  }, [selectedSubtitleTrack]);
+
   const progress = duration ? (currentTime / duration) * 100 : 0;
 
   if (!videoFile) {
@@ -433,7 +476,8 @@ const MoviePlayer: React.FC = () => {
           <div className="text-sm text-gray-500 mt-6 space-y-2">
             <p><strong>Best Support:</strong> MP4, WebM, OGG</p>
             <p><strong>Limited Support:</strong> MKV, AVI, MOV (depends on codecs)</p>
-            <p className="text-xs text-gray-600">For MKV files, ensure they use H.264/H.265 video and AAC/MP3 audio codecs</p>
+            <p className="text-xs text-gray-600">MKV files with embedded subtitles are automatically detected</p>
+            <p className="text-xs text-gray-600">For best compatibility, use H.264/H.265 video with AAC/MP3 audio</p>
           </div>
         </div>
       </div>
@@ -676,8 +720,8 @@ const MoviePlayer: React.FC = () => {
                     <button
                       onClick={() => setSelectedSubtitleTrack('off')}
                       className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                        selectedSubtitleTrack === 'off' 
-                          ? 'bg-red-600 text-white' 
+                        selectedSubtitleTrack === 'off'
+                          ? 'bg-red-600 text-white'
                           : 'text-gray-300 hover:bg-gray-700'
                       }`}
                     >
@@ -688,19 +732,27 @@ const MoviePlayer: React.FC = () => {
                         key={track.id}
                         onClick={() => setSelectedSubtitleTrack(track.id)}
                         className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${
-                          selectedSubtitleTrack === track.id 
-                            ? 'bg-red-600 text-white' 
+                          selectedSubtitleTrack === track.id
+                            ? 'bg-red-600 text-white'
                             : 'text-gray-300 hover:bg-gray-700'
                         }`}
                       >
-                        {track.label}
+                        <div className="flex items-center justify-between">
+                          <span>{track.label}</span>
+                          {track.id.startsWith('embedded-') && (
+                            <span className="text-xs text-gray-400">(Embedded)</span>
+                          )}
+                        </div>
+                        {track.language !== 'Unknown' && (
+                          <span className="text-xs text-gray-400"> - {track.language}</span>
+                        )}
                       </button>
                     ))}
                     <label
                       htmlFor="subtitle-upload-player"
                       className="w-full text-left px-3 py-2 rounded text-sm text-blue-400 hover:bg-gray-700 cursor-pointer block"
                     >
-                      + Add Subtitle File
+                      + Add External Subtitle
                     </label>
                     <input
                       type="file"
